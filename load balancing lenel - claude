@@ -1,0 +1,689 @@
+Great question - let me break down the OpenAccess architecture and what you'd need to intercept:
+
+## OpenAccess Communication Protocol
+OpenAccess typically uses:
+- **HTTPS/REST API** on port 8443 (default)
+- **LNVR video streams** on various ports if you're doing video integration
+- **Database connections** (SQL Server) - though this is server-side, not client-facing
+
+The client applications (badge readers, third-party integrations, custom apps) make HTTPS requests to the OpenAccess server.
+
+## Load Balancing Options
+
+### Option 1: Standard Reverse Proxy (Simplest)
+You can use existing tools without building custom middleware:
+
+**HAProxy** (my recommendation):
+```haproxy
+frontend openaccess_frontend
+    bind *:8443 ssl crt /path/to/cert.pem
+    mode http
+    default_backend openaccess_servers
+
+backend openaccess_servers
+    mode http
+    balance roundrobin
+    option httpchk GET /api/access/onguard/openaccess
+    server oa1 oa-server1.domain.com:8443 check ssl verify none
+    server oa2 oa-server2.domain.com:8443 check ssl verify none
+    server oa3 oa-server3.domain.com:8443 check ssl verify none
+```
+
+**Nginx** alternative:
+```nginx
+upstream openaccess_cluster {
+    least_conn;
+    server oa-server1.domain.com:8443 max_fails=3 fail_timeout=30s;
+    server oa-server2.domain.com:8443 max_fails=3 fail_timeout=30s;
+    server oa-server3.domain.com:8443 max_fails=3 fail_timeout=30s;
+}
+
+server {
+    listen 8443 ssl;
+    server_name openaccess.yourdomain.com;
+    
+    ssl_certificate /path/to/cert.crt;
+    ssl_certificate_key /path/to/cert.key;
+    
+    location / {
+        proxy_pass https://openaccess_cluster;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_ssl_verify off;
+    }
+}
+```
+
+### Option 2: Custom Middleware (More Control)
+If you need custom routing logic (like routing specific badge readers to specific servers), you'd build something like:
+
+**PowerShell-based proxy** (since you're comfortable with PS):
+```powershell
+# Simple HTTP proxy concept
+$listener = New-Object System.Net.HttpListener
+$listener.Prefixes.Add("https://+:8443/")
+$listener.Start()
+
+$backends = @(
+    "https://oa-server1:8443",
+    "https://oa-server2:8443",
+    "https://oa-server3:8443"
+)
+$currentBackend = 0
+
+while ($listener.IsListening) {
+    $context = $listener.GetContext()
+    $request = $context.Request
+    $response = $context.Response
+    
+    # Round-robin selection
+    $targetServer = $backends[$currentBackend]
+    $currentBackend = ($currentBackend + 1) % $backends.Count
+    
+    # Forward request
+    $targetUrl = $targetServer + $request.Url.PathAndQuery
+    try {
+        $result = Invoke-RestMethod -Uri $targetUrl -Method $request.HttpMethod `
+            -Headers $request.Headers -Body $request.InputStream
+        
+        # Send response back
+        $buffer = [System.Text.Encoding]::UTF8.GetBytes($result)
+        $response.ContentLength64 = $buffer.Length
+        $response.OutputStream.Write($buffer, 0, $buffer.Length)
+    }
+    catch {
+        $response.StatusCode = 502
+    }
+    finally {
+        $response.Close()
+    }
+}
+```
+
+**Or a more robust C# service** that runs as a Windows service with health checking.
+
+## Client-Side Configuration
+
+### For Lenel Hardware (Badge Readers, Controllers)
+In the **OnGuard System Administration**:
+1. Go to the controller/panel configuration
+2. Change the OpenAccess server address from `oa-server1.domain.com` to `openaccess-lb.domain.com`
+3. The hardware will now connect to your load balancer FQDN
+
+### For Third-Party Integrations
+Update their configuration files/connection strings:
+- Old: `https://oa-server1.domain.com:8443`
+- New: `https://openaccess-lb.domain.com:8443`
+
+### DNS Configuration
+Create a DNS A record:
+```
+openaccess-lb.domain.com -> 10.0.1.100 (your load balancer IP)
+```
+
+Or use DNS round-robin (simpler but less sophisticated):
+```
+openaccess.domain.com -> 10.0.1.101
+openaccess.domain.com -> 10.0.1.102
+openaccess.domain.com -> 10.0.1.103
+```
+
+## Session Affinity Concerns
+Some OpenAccess operations might require **sticky sessions**. If you see issues:
+
+In HAProxy:
+```haproxy
+backend openaccess_servers
+    balance roundrobin
+    cookie SERVERID insert indirect nocache
+    server oa1 oa-server1:8443 check cookie oa1
+    server oa2 oa-server2:8443 check cookie oa2
+```
+
+In Nginx:
+```nginx
+upstream openaccess_cluster {
+    ip_hash;  # Same client IP always goes to same server
+    server oa-server1:8443;
+    server oa-server2:8443;
+}
+```
+
+## My Recommendation
+Start with **HAProxy or Nginx** rather than building custom middleware. They're battle-tested, handle SSL termination well, have health checking built-in, and you can always add custom logic later if needed.
+
+The custom middleware approach makes sense if you need:
+- Complex routing based on request content (like routing specific badge IDs to specific servers)
+- Custom authentication/authorization layers
+- Detailed logging of Lenel-specific operations
+- Request transformation or filtering
+
+------------------------------------------------------
+Perfect - then you can do proper horizontal scaling. Here's a complete implementation plan:
+
+## Architecture Overview
+
+```
+[Clients/Badge Readers/Integrations]
+            ↓
+    [HAProxy Load Balancer]
+            ↓
+    ┌───────┴───────┬───────────┐
+    ↓               ↓           ↓
+[OpenAccess 1] [OpenAccess 2] [OpenAccess 3]
+    ↓               ↓           ↓
+    └───────┬───────┴───────────┘
+            ↓
+    [Shared SQL Database]
+            ↓
+    [RabbitMQ Cluster]
+    (3 nodes minimum)
+```
+
+## Step-by-Step Implementation
+
+### Phase 1: RabbitMQ Cluster (Do This First)
+
+RabbitMQ clustering is critical since OpenAccess depends on it.
+
+**Server Setup:**
+- VM1: rabbitmq-01.domain.com (10.0.1.201)
+- VM2: rabbitmq-02.domain.com (10.0.1.202)  
+- VM3: rabbitmq-03.domain.com (10.0.1.203)
+
+**Installation on each node:**
+```powershell
+# Install Erlang first (RabbitMQ dependency)
+choco install erlang -y
+
+# Install RabbitMQ
+choco install rabbitmq -y
+
+# Enable management plugin
+rabbitmq-plugins enable rabbitmq_management
+
+# Set erlang cookie (must be IDENTICAL on all nodes)
+$cookieFile = "$env:USERPROFILE\.erlang.cookie"
+"YOURSECRETCOOKIEHERE" | Out-File -FilePath $cookieFile -Encoding ASCII -NoNewline
+
+# Restart service
+Restart-Service RabbitMQ
+```
+
+**Create the cluster:**
+```powershell
+# On rabbitmq-02 and rabbitmq-03, run:
+rabbitmqctl stop_app
+rabbitmqctl join_cluster rabbit@rabbitmq-01
+rabbitmqctl start_app
+
+# Verify cluster status (run on any node)
+rabbitmqctl cluster_status
+```
+
+**Configure high availability policy:**
+```powershell
+# This ensures queues are replicated across all nodes
+rabbitmqctl set_policy ha-all "^" '{"ha-mode":"all","ha-sync-mode":"automatic","ha-sync-batch-size":5}'
+
+# For quorum queues (recommended for critical queues)
+rabbitmqctl set_policy quorum-policy "^quorum\." '{"queue-type":"quorum","delivery-limit":3}'
+```
+
+**RabbitMQ HAProxy Config:**
+```haproxy
+# /etc/haproxy/haproxy.cfg
+
+listen rabbitmq_cluster
+    bind *:5672
+    mode tcp
+    balance roundrobin
+    option tcplog
+    
+    server rabbitmq-01 10.0.1.201:5672 check inter 5s rise 2 fall 3
+    server rabbitmq-02 10.0.1.202:5672 check inter 5s rise 2 fall 3
+    server rabbitmq-03 10.0.1.203:5672 check inter 5s rise 2 fall 3
+
+listen rabbitmq_mgmt
+    bind *:15672
+    mode http
+    balance roundrobin
+    
+    server rabbitmq-01 10.0.1.201:15672 check
+    server rabbitmq-02 10.0.1.202:15672 check
+    server rabbitmq-03 10.0.1.203:15672 check
+```
+
+### Phase 2: OpenAccess Instances
+
+**Server Setup:**
+- VM1: openaccess-01.domain.com (10.0.1.101)
+- VM2: openaccess-02.domain.com (10.0.1.102)
+- VM3: openaccess-03.domain.com (10.0.1.103)
+
+**Install Lenel OpenAccess on each VM** (standard installation)
+
+**Key configuration changes for each instance:**
+
+```xml
+<!-- In OpenAccess config file (typically C:\Program Files\Lenel\OnGuard\OpenAccess\) -->
+<configuration>
+  <connectionStrings>
+    <!-- All instances point to SAME database -->
+    <add name="OnGuardConnection" 
+         connectionString="Server=sql-server.domain.com;Database=OnGuard;Integrated Security=true;Max Pool Size=200;" />
+  </connectionStrings>
+  
+  <appSettings>
+    <!-- Point to RabbitMQ load balancer -->
+    <add key="RabbitMQHost" value="rabbitmq-lb.domain.com" />
+    <add key="RabbitMQPort" value="5672" />
+    
+    <!-- Increase thread pool for performance -->
+    <add key="MaxConcurrentRequests" value="100" />
+    <add key="RequestQueueLimit" value="500" />
+    
+    <!-- Unique identifier for each instance (important for logging) -->
+    <add key="InstanceId" value="OA-01" />  <!-- Change per server -->
+  </appSettings>
+</configuration>
+```
+
+**Performance tuning on each OpenAccess server:**
+```powershell
+# Increase IIS application pool settings
+Import-Module WebAdministration
+
+$appPoolName = "OpenAccessAppPool"
+
+# Increase queue length
+Set-ItemProperty "IIS:\AppPools\$appPoolName" -Name queueLength -Value 2000
+
+# Disable idle timeout
+Set-ItemProperty "IIS:\AppPools\$appPoolName" -Name processModel.idleTimeout -Value ([TimeSpan]::Zero)
+
+# Increase max worker processes
+Set-ItemProperty "IIS:\AppPools\$appPoolName" -Name processModel.maxProcesses -Value 4
+
+# Memory limits
+Set-ItemProperty "IIS:\AppPools\$appPoolName" -Name recycling.periodicRestart.memory -Value 0
+
+Restart-WebAppPool -Name $appPoolName
+```
+
+### Phase 3: HAProxy Load Balancer
+
+**Single dedicated VM for HAProxy:**
+- openaccess-lb.domain.com (10.0.1.100)
+
+**Install HAProxy on Windows:**
+```powershell
+# Using chocolatey
+choco install haproxy -y
+
+# Or download from: https://www.haproxy.org/download/windows/
+```
+
+**Complete HAProxy configuration:**
+```haproxy
+# C:\ProgramData\HAProxy\haproxy.cfg
+
+global
+    maxconn 10000
+    log 127.0.0.1 local0
+    stats socket /var/run/haproxy.sock mode 660 level admin
+    stats timeout 30s
+
+defaults
+    log global
+    mode http
+    option httplog
+    option dontlognull
+    timeout connect 10s
+    timeout client 60s
+    timeout server 60s
+    retries 3
+    option redispatch
+
+# Statistics page
+listen stats
+    bind *:8404
+    stats enable
+    stats uri /stats
+    stats refresh 10s
+    stats admin if TRUE
+
+# OpenAccess HTTPS Frontend
+frontend openaccess_https
+    bind *:8443 ssl crt /path/to/combined-cert.pem
+    mode http
+    
+    # Logging
+    option httplog
+    log-format "%ci:%cp [%tr] %ft %b/%s %TR/%Tw/%Tc/%Tr/%Ta %ST %B %CC %CS %tsc %ac/%fc/%bc/%sc/%rc %sq/%bq %hr %hs %{+Q}r"
+    
+    # Security headers
+    http-response set-header X-Frame-Options SAMEORIGIN
+    http-response set-header X-Content-Type-Options nosniff
+    
+    # Rate limiting per IP
+    stick-table type ip size 100k expire 30s store http_req_rate(10s),http_err_rate(10s)
+    http-request track-sc0 src
+    http-request deny deny_status 429 if { sc_http_req_rate(0) gt 200 }
+    
+    default_backend openaccess_pool
+
+# OpenAccess Backend Pool
+backend openaccess_pool
+    mode http
+    balance leastconn  # Route to server with fewest connections
+    
+    # Health check
+    option httpchk GET /api/access/onguard/openaccess/version
+    http-check expect status 200
+    
+    # Cookie-based session persistence (if needed)
+    cookie SERVERID insert indirect nocache
+    
+    # Server definitions
+    server oa-01 10.0.1.101:8443 ssl verify none check inter 3s rise 2 fall 5 maxconn 300 cookie oa01
+    server oa-02 10.0.1.102:8443 ssl verify none check inter 3s rise 2 fall 5 maxconn 300 cookie oa02
+    server oa-03 10.0.1.103:8443 ssl verify none check inter 3s rise 2 fall 5 maxconn 300 cookie oa03
+    
+    # Backup server (if all primaries fail)
+    # server oa-backup 10.0.1.104:8443 ssl verify none check backup
+
+# RabbitMQ Frontend
+frontend rabbitmq_amqp
+    bind *:5672
+    mode tcp
+    default_backend rabbitmq_cluster
+
+backend rabbitmq_cluster
+    mode tcp
+    balance roundrobin
+    option tcp-check
+    
+    server rabbit-01 10.0.1.201:5672 check inter 5s
+    server rabbit-02 10.0.1.202:5672 check inter 5s
+    server rabbit-03 10.0.1.203:5672 check inter 5s
+
+# RabbitMQ Management Interface
+frontend rabbitmq_mgmt
+    bind *:15672
+    mode http
+    default_backend rabbitmq_mgmt_cluster
+
+backend rabbitmq_mgmt_cluster
+    mode http
+    balance roundrobin
+    option httpchk GET /api/aliveness-test/%2F
+    http-check expect status 200
+    
+    server rabbit-01 10.0.1.201:15672 check
+    server rabbit-02 10.0.1.202:15672 check
+    server rabbit-03 10.0.1.203:15672 check
+```
+
+**Install as Windows service:**
+```powershell
+# Create service
+New-Service -Name "HAProxy" `
+    -BinaryPathName "C:\Program Files\HAProxy\haproxy.exe -f C:\ProgramData\HAProxy\haproxy.cfg" `
+    -DisplayName "HAProxy Load Balancer" `
+    -StartupType Automatic
+
+Start-Service HAProxy
+```
+
+### Phase 4: DNS Configuration
+
+```powershell
+# In your DNS server, create:
+# A record for load balancer
+Add-DnsServerResourceRecordA -Name "openaccess-lb" -ZoneName "domain.com" -IPv4Address "10.0.1.100"
+
+# A record for RabbitMQ load balancer (can be same server)
+Add-DnsServerResourceRecordA -Name "rabbitmq-lb" -ZoneName "domain.com" -IPv4Address "10.0.1.100"
+
+# Optional: CNAME for easier migration
+Add-DnsServerResourceRecordCName -Name "openaccess" -HostNameAlias "openaccess-lb.domain.com" -ZoneName "domain.com"
+```
+
+### Phase 5: Client Configuration Changes
+
+**Update Lenel hardware/controllers:**
+1. Open OnGuard System Administration
+2. Navigate to Hardware → Communication Servers
+3. Change OpenAccess server address:
+   - Old: `openaccess-01.domain.com:8443`
+   - New: `openaccess-lb.domain.com:8443`
+
+**Update third-party integrations:**
+```powershell
+# Example: Update connection strings in config files
+$configFiles = Get-ChildItem -Path "C:\Integrations" -Filter "*.config" -Recurse
+
+foreach ($file in $configFiles) {
+    (Get-Content $file.FullName) `
+        -replace 'openaccess-01\.domain\.com', 'openaccess-lb.domain.com' `
+        -replace 'rabbitmq-01\.domain\.com', 'rabbitmq-lb.domain.com' |
+    Set-Content $file.FullName
+}
+```
+
+### Phase 6: Monitoring & Alerting
+
+**Monitoring script for the entire stack:**
+```powershell
+# ClusterHealthMonitor.ps1
+
+$config = @{
+    HAProxyStats = "http://openaccess-lb.domain.com:8404/stats"
+    OpenAccessServers = @(
+        "https://openaccess-01.domain.com:8443/api/access/onguard/openaccess/version",
+        "https://openaccess-02.domain.com:8443/api/access/onguard/openaccess/version",
+        "https://openaccess-03.domain.com:8443/api/access/onguard/openaccess/version"
+    )
+    RabbitMQNodes = @(
+        "http://rabbitmq-01.domain.com:15672/api/nodes",
+        "http://rabbitmq-02.domain.com:15672/api/nodes",
+        "http://rabbitmq-03.domain.com:15672/api/nodes"
+    )
+    AlertEmail = "admin@domain.com"
+    SMTPServer = "smtp.domain.com"
+}
+
+function Send-Alert {
+    param($Subject, $Body)
+    
+    Send-MailMessage -To $config.AlertEmail `
+        -From "lenel-monitor@domain.com" `
+        -Subject $Subject `
+        -Body $Body `
+        -SmtpServer $config.SMTPServer
+}
+
+function Test-OpenAccessHealth {
+    $results = @()
+    
+    foreach ($server in $config.OpenAccessServers) {
+        try {
+            $response = Invoke-RestMethod -Uri $server -TimeoutSec 5
+            $results += [PSCustomObject]@{
+                Server = $server
+                Status = "Healthy"
+                ResponseTime = (Measure-Command { Invoke-RestMethod -Uri $server }).TotalMilliseconds
+            }
+        }
+        catch {
+            $results += [PSCustomObject]@{
+                Server = $server
+                Status = "Down"
+                Error = $_.Exception.Message
+            }
+            Send-Alert "OpenAccess Server Down" "Server $server is not responding: $($_.Exception.Message)"
+        }
+    }
+    
+    return $results
+}
+
+function Test-RabbitMQHealth {
+    $results = @()
+    $cred = Get-Credential # Store credentials securely
+    
+    foreach ($node in $config.RabbitMQNodes) {
+        try {
+            $response = Invoke-RestMethod -Uri $node -Credential $cred -TimeoutSec 5
+            $results += [PSCustomObject]@{
+                Node = $node
+                Status = "Running"
+                MemoryUsed = $response[0].mem_used
+                MemoryLimit = $response[0].mem_limit
+                DiskFree = $response[0].disk_free
+            }
+        }
+        catch {
+            $results += [PSCustomObject]@{
+                Node = $node
+                Status = "Down"
+                Error = $_.Exception.Message
+            }
+            Send-Alert "RabbitMQ Node Down" "Node $node is not responding"
+        }
+    }
+    
+    return $results
+}
+
+function Get-HAProxyStats {
+    try {
+        $stats = Invoke-WebRequest -Uri $config.HAProxyStats -UseBasicParsing
+        # Parse HAProxy stats page
+        # (Implementation depends on your stats format)
+        return $stats
+    }
+    catch {
+        Send-Alert "HAProxy Unreachable" "Cannot retrieve HAProxy statistics"
+    }
+}
+
+# Main monitoring loop
+while ($true) {
+    Write-Host "`n=== Health Check $(Get-Date) ==="
+    
+    $oaHealth = Test-OpenAccessHealth
+    $oaHealth | Format-Table -AutoSize
+    
+    $rabbitHealth = Test-RabbitMQHealth
+    $rabbitHealth | Format-Table -AutoSize
+    
+    # Check for overall cluster health
+    $healthyOA = ($oaHealth | Where-Object { $_.Status -eq "Healthy" }).Count
+    $healthyRabbit = ($rabbitHealth | Where-Object { $_.Status -eq "Running" }).Count
+    
+    if ($healthyOA -eq 0) {
+        Send-Alert "CRITICAL: All OpenAccess Servers Down" "Immediate attention required!"
+    }
+    elseif ($healthyOA -lt 2) {
+        Send-Alert "WARNING: Only $healthyOA OpenAccess server(s) healthy" "Consider investigating"
+    }
+    
+    if ($healthyRabbit -lt 2) {
+        Send-Alert "WARNING: RabbitMQ cluster degraded" "Only $healthyRabbit node(s) healthy"
+    }
+    
+    Start-Sleep -Seconds 60
+}
+```
+
+**Install as scheduled task:**
+```powershell
+$action = New-ScheduledTaskAction -Execute "PowerShell.exe" `
+    -Argument "-ExecutionPolicy Bypass -File C:\Scripts\ClusterHealthMonitor.ps1"
+
+$trigger = New-ScheduledTaskTrigger -AtStartup
+
+$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount
+
+Register-ScheduledTask -TaskName "LenelClusterMonitor" `
+    -Action $action `
+    -Trigger $trigger `
+    -Principal $principal
+```
+
+## Testing & Validation
+
+**Load testing script:**
+```powershell
+# LoadTest.ps1 - Simulate multiple clients
+
+$endpoint = "https://openaccess-lb.domain.com:8443/api/access/onguard/openaccess/cardholders"
+$concurrent = 50
+$iterations = 100
+
+$jobs = 1..$concurrent | ForEach-Object {
+    Start-Job -ScriptBlock {
+        param($url, $count)
+        
+        $results = @()
+        for ($i = 0; $i -lt $count; $i++) {
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            try {
+                $response = Invoke-RestMethod -Uri $url -Method GET -TimeoutSec 30
+                $results += [PSCustomObject]@{
+                    Success = $true
+                    ResponseTime = $sw.ElapsedMilliseconds
+                }
+            }
+            catch {
+                $results += [PSCustomObject]@{
+                    Success = $false
+                    Error = $_.Exception.Message
+                }
+            }
+            $sw.Stop()
+        }
+        return $results
+    } -ArgumentList $endpoint, $iterations
+}
+
+# Wait for all jobs and collect results
+$allResults = $jobs | Wait-Job | Receive-Job
+$jobs | Remove-Job
+
+# Analyze
+$successful = ($allResults | Where-Object { $_.Success }).Count
+$failed = ($allResults | Where-Object { -not $_.Success }).Count
+$avgResponseTime = ($allResults | Where-Object { $_.Success } | Measure-Object -Property ResponseTime -Average).Average
+
+Write-Host "Load Test Results:"
+Write-Host "Successful requests: $successful"
+Write-Host "Failed requests: $failed"
+Write-Host "Average response time: $($avgResponseTime)ms"
+```
+
+## Rollback Plan
+
+Keep your original single-server configs backed up:
+```powershell
+# Backup current configs
+$backupPath = "C:\Backups\PreLoadBalancing_$(Get-Date -Format 'yyyyMMdd')"
+New-Item -ItemType Directory -Path $backupPath
+
+# Backup OpenAccess config
+Copy-Item "C:\Program Files\Lenel\OnGuard\OpenAccess\web.config" `
+    -Destination "$backupPath\web.config.bak"
+
+# Export DNS records
+Get-DnsServerResourceRecord -ZoneName "domain.com" | 
+    Export-Csv "$backupPath\dns_records.csv"
+```
+
+This setup should handle your performance issues by distributing load across multiple servers. The key is that RabbitMQ clustering provides message queue redundancy, and OpenAccess instances can scale horizontally since they're stateless (state is in the database).
+
+What's your timeline for this? I'd recommend doing it in phases - RabbitMQ first, then add OpenAccess instances one at a time to minimize risk.
+
+Would you be load balancing for redundancy, performance, or both? That might affect whether you need active-active or active-passive setup.

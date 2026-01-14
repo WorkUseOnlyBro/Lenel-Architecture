@@ -1,3 +1,61 @@
 - run open access in container 
 https://docs.his.hidglobal.com/user-documentation/his-agents/his-lenels2-onguard-agent?
 
+- Running in docker 
+https://www.savanceworkplace.com/pdf/ACI-Guides/Savance-Workplace-LenelS2-OnGuard-Integration-Setup-Guide.pdf?
+
+- how to access documentation 
+https://kb.lenels2.com/home/how-to-access-onguard-documentation?
+
+Web / IIS components can be load balanced this way 
+- https://learn.microsoft.com/en-us/iis/web-hosting/scenario-build-a-web-farm-with-iis-servers/configuring-step-3-configure-iis-web-farm-load-balancing?utm_source=chatgpt.com
+
+HDPE (not lenel) load balancing on gaurd in a cluster
+- https://support.hpe.com/hpesc/public/docDisplay?docId=sf000094708en_us&docLocale=en_US&utm_source=chatgpt.com
+
+Comm server failover in cluster 
+- https://kb.lenels2.com/home/how-to-remove-the-machine-name-failover-on-a-system-that-is-no-longer-clustered?utm_source=chatgpt.com
+
+Lenel NVR/HVR failover 
+- https://kb.lenels2.com/home/best-practices-for-configuring-lenel-nvrhvr-failover?utm_source=chatgpt.com
+
+GPT comments on load balancing
+4) Practical “load balancing” patterns that do work with OnGuard ecosystems
+Even if Lenel services themselves aren’t actively load balanced, people commonly build:
+Two+ web/app servers behind an LB (ARR/F5/NetScaler/NGINX) for the UI/API tier
+Database HA separately (SQL clustering/AG) (this is usually where OnGuard doc goes next, but it’s gated)
+Service redundancy where supported (comm server, recorder failover), not LB
+
+Claude on load balancing 
+
+Direct RabbitMQ Clustering
+RabbitMQ has built-in clustering and load balancing capabilities. You could:
+
+Set up a RabbitMQ cluster with multiple nodes
+Use HAProxy or similar load balancer in front of the cluster
+Configure OpenAccess clients to connect through the load balancer endpoint
+RabbitMQ's native mirrored queues can provide redundancy
+
+Middleware/Proxy Approach
+Your middleman server idea has merit:
+
+Build a lightweight service that acts as a message broker proxy
+It receives requests and routes them to available OnGuard instances based on load
+Could use round-robin, least-connections, or health-check based routing
+This gives you more control over routing logic specific to Lenel workflows
+
+Application-Level Load Balancing
+
+Deploy multiple OpenAccess server instances
+Use DNS round-robin or a Layer 4 load balancer (F5, Nginx, HAProxy)
+Each instance connects to its own or shared database
+May need to handle session affinity for certain operations
+
+Considerations Specific to Lenel
+
+Licensing: Check if your Lenel licenses support multiple concurrent OpenAccess instances
+Database contention: Multiple OpenAccess instances hitting the same SQL database may create bottlenecks
+Event synchronization: Ensure real-time events (door opens, alarms) are properly distributed
+State management: Some operations may require sticky sessions
+
+What's your current bottleneck - is it the message queuing, the OpenAccess API processing, or database queries? That would help determine the best approach.

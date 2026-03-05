@@ -1,0 +1,281 @@
+"""
+Panel Load Balancer
+-------------------
+Distributes panels across communication servers to minimize standard deviation
+of connection counts per server.
+
+Usage:
+    python panel_balancer.py <csv_file> <num_servers> <group_name>
+
+CSV format (with header row):
+    panel_name,connection_count
+
+Example:
+    python panel_balancer.py central_panels.csv 2 "Central Time"
+"""
+
+import csv
+import sys
+import itertools
+from statistics import stdev, mean
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+
+def load_panels(filepath):
+    panels = []
+    with open(filepath, newline='', encoding='utf-8-sig') as f:
+        reader = csv.reader(f)
+        next(reader)  # skip header
+        for row in reader:
+            if not row or not row[0].strip():
+                continue
+            name = row[0].strip()
+            count = int(row[1].strip().replace(',', ''))
+            panels.append((name, count))
+    return panels
+
+
+# ---------------------------------------------------------------------------
+# Core helpers
+# ---------------------------------------------------------------------------
+
+def server_totals(servers):
+    return [sum(p[1] for p in s) for s in servers]
+
+
+def compute_std_dev(servers):
+    totals = server_totals(servers)
+    return stdev(totals) if len(totals) > 1 else 0.0
+
+
+def sum_of_squares(totals, mu):
+    return sum((t - mu) ** 2 for t in totals)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: Greedy LPT assignment
+# ---------------------------------------------------------------------------
+
+def greedy_assign(panels, num_servers):
+    """
+    Longest Processing Time (LPT) heuristic.
+    Sort panels descending, assign each to the server with the lowest current total.
+    """
+    servers = [[] for _ in range(num_servers)]
+    for panel in sorted(panels, key=lambda x: x[1], reverse=True):
+        totals = server_totals(servers)
+        servers[totals.index(min(totals))].append(panel)
+    return servers
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Refinement
+# ---------------------------------------------------------------------------
+
+def refine(servers, max_combo_depth=3):
+    """
+    Iteratively improve assignments using three strategies in priority order:
+      1. Single panel move  — move one panel to a lower server if it reduces sum of squares
+      2. Pairwise swap      — swap one panel between two servers if it reduces sum of squares
+      3. Combo move         — move a combination of panels (up to max_combo_depth) if it helps
+
+    Each strategy recalculates the target delta (server_total - mean) so the search
+    is always chasing the exact correction needed rather than guessing blindly.
+    Repeats until no strategy finds an improvement.
+    """
+    improved = True
+    while improved:
+        improved = False
+        totals = server_totals(servers)
+        mu = mean(totals)
+
+        # --- Strategy 1: single panel move ---
+        # For the most overloaded server, find a panel whose value is closest
+        # to the excess (T_i - mu) that also improves sum of squares when moved
+        # to the most underloaded server.
+        for i in range(len(servers)):
+            for j in range(len(servers)):
+                if i == j or totals[i] <= totals[j]:
+                    continue
+                old_sq = (totals[i] - mu) ** 2 + (totals[j] - mu) ** 2
+                best_panel = None
+                best_sq = old_sq
+                for panel in servers[i]:
+                    new_ti = totals[i] - panel[1]
+                    new_tj = totals[j] + panel[1]
+                    new_sq = (new_ti - mu) ** 2 + (new_tj - mu) ** 2
+                    if new_sq < best_sq:
+                        best_sq = new_sq
+                        best_panel = panel
+                if best_panel:
+                    servers[i].remove(best_panel)
+                    servers[j].append(best_panel)
+                    totals = server_totals(servers)
+                    improved = True
+                    break
+            if improved:
+                break
+
+        if improved:
+            continue
+
+        # --- Strategy 2: pairwise swap ---
+        # For every pair of servers, find the panel swap that most reduces
+        # sum of squares. The ideal swap satisfies: c_i - c_j ≈ T_a - mu.
+        for i in range(len(servers)):
+            for j in range(i + 1, len(servers)):
+                old_sq = (totals[i] - mu) ** 2 + (totals[j] - mu) ** 2
+                best_swap = None
+                best_sq = old_sq
+                for pi in servers[i]:
+                    for pj in servers[j]:
+                        new_ti = totals[i] - pi[1] + pj[1]
+                        new_tj = totals[j] - pj[1] + pi[1]
+                        new_sq = (new_ti - mu) ** 2 + (new_tj - mu) ** 2
+                        if new_sq < best_sq:
+                            best_sq = new_sq
+                            best_swap = (pi, pj)
+                if best_swap:
+                    pi, pj = best_swap
+                    servers[i].remove(pi)
+                    servers[j].remove(pj)
+                    servers[i].append(pj)
+                    servers[j].append(pi)
+                    totals = server_totals(servers)
+                    improved = True
+                    break
+            if improved:
+                break
+
+        if improved:
+            continue
+
+        # --- Strategy 3: combination move ---
+        # If no single move or swap helps, try moving a group of panels together.
+        # The target is a combo whose sum is close to (T_i - mu).
+        # Capped at max_combo_depth to keep it tractable.
+        if max_combo_depth >= 2:
+            for i in range(len(servers)):
+                if totals[i] <= mu:
+                    continue
+                for j in range(len(servers)):
+                    if i == j or totals[j] >= mu:
+                        continue
+                    old_sq = (totals[i] - mu) ** 2 + (totals[j] - mu) ** 2
+                    found = False
+                    for depth in range(2, max_combo_depth + 1):
+                        for combo in itertools.combinations(servers[i], depth):
+                            combo_sum = sum(p[1] for p in combo)
+                            new_ti = totals[i] - combo_sum
+                            new_tj = totals[j] + combo_sum
+                            new_sq = (new_ti - mu) ** 2 + (new_tj - mu) ** 2
+                            if new_sq < old_sq:
+                                for p in combo:
+                                    servers[i].remove(p)
+                                    servers[j].append(p)
+                                totals = server_totals(servers)
+                                improved = True
+                                found = True
+                                break
+                        if found:
+                            break
+                    if improved:
+                        break
+                if improved:
+                    break
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+def print_results(servers, group_name, initial_sd, final_sd):
+    totals = server_totals(servers)
+    mu = mean(totals)
+
+    print(f"\n{'=' * 60}")
+    print(f"  Group : {group_name}")
+    print(f"  Servers : {len(servers)}    Panels : {sum(len(s) for s in servers)}")
+    print(f"  Mean connections/server : {mu:>15,.0f}")
+    print(f"  Std dev after greedy    : {initial_sd:>15,.0f}")
+    print(f"  Std dev after refinement: {final_sd:>15,.0f}")
+    print(f"{'=' * 60}\n")
+
+    for idx, server in enumerate(servers, 1):
+        total = sum(p[1] for p in server)
+        delta = total - mu
+        print(f"  Server {idx}  |  Total: {total:>12,}  |  Delta: {delta:>+12,.0f}")
+        print(f"  {'-' * 56}")
+        for panel in sorted(server, key=lambda x: x[1], reverse=True):
+            print(f"    {panel[0]:<45} {panel[1]:>12,}")
+        print()
+
+
+# ---------------------------------------------------------------------------
+# CSV output
+# ---------------------------------------------------------------------------
+
+def write_csv(servers, group_name, initial_sd, final_sd, filepath):
+    totals = server_totals(servers)
+    mu = mean(totals)
+
+    with open(filepath, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+
+        # Summary block at top
+        writer.writerow(['Group', group_name])
+        writer.writerow(['Mean connections/server', f'{mu:,.0f}'])
+        writer.writerow(['Std dev after greedy', f'{initial_sd:,.0f}'])
+        writer.writerow(['Std dev after refinement', f'{final_sd:,.0f}'])
+        writer.writerow([])
+
+        for idx, server in enumerate(servers, 1):
+            total = sum(p[1] for p in server)
+            delta = total - mu
+            writer.writerow([f'Server {idx}', f'Total: {total:,}', f'Delta: {delta:+,.0f}'])
+            writer.writerow(['Panel Name', 'Connection Count'])
+            for panel in sorted(server, key=lambda x: x[1], reverse=True):
+                writer.writerow([panel[0], panel[1]])
+            writer.writerow([])
+
+    print(f"CSV written to '{filepath}'")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    if len(sys.argv) < 4:
+        print("Usage: python panel_balancer.py <csv_file> <num_servers> <group_name> [output.csv]")
+        print('Example: python panel_balancer.py central.csv 2 "Central Time" central_output.csv')
+        sys.exit(1)
+
+    filepath    = sys.argv[1]
+    num_servers = int(sys.argv[2])
+    group_name  = sys.argv[3]
+    output_csv  = sys.argv[4] if len(sys.argv) >= 5 else None
+
+    panels = load_panels(filepath)
+    print(f"Loaded {len(panels)} panels from '{filepath}'")
+
+    servers    = greedy_assign(panels, num_servers)
+    initial_sd = compute_std_dev(servers)
+    print(f"Greedy std dev : {initial_sd:,.0f}")
+
+    refine(servers)
+    final_sd = compute_std_dev(servers)
+    print(f"Refined std dev: {final_sd:,.0f}")
+
+    print_results(servers, group_name, initial_sd, final_sd)
+
+    if output_csv:
+        write_csv(servers, group_name, initial_sd, final_sd, output_csv)
+
+
+if __name__ == "__main__":
+    main()

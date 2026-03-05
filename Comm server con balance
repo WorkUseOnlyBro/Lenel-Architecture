@@ -279,3 +279,177 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+#--------------------------------------------------------------------------
+explination 
+Glad it worked. I'll walk through it section by section, and where Python syntax is unique I'll reference how you'd do the same thing in PowerShell or C# since that's your frame of reference.
+
+---
+
+**Imports**
+```python
+import csv
+import sys
+import itertools
+from statistics import stdev, mean
+from pathlib import Path
+```
+Same concept as `using` in C# or `Import-Module` in PowerShell. `from X import Y` means "only pull in this specific function from that library" so you can call `stdev()` directly instead of `statistics.stdev()`.
+
+---
+
+**Loading the CSV**
+```python
+def load_panels(filepath):
+    panels = []
+    with open(filepath, newline='', encoding='utf-8-sig') as f:
+        reader = csv.reader(f)
+        next(reader)  # skip header
+        for row in reader:
+            if not row or not row[0].strip():
+                continue
+            name = row[0].strip()
+            count = int(row[1].strip().replace(',', ''))
+            panels.append((name, count))
+    return panels
+```
+
+- `def` is how you declare a function — no return type declaration like C#, Python is dynamically typed
+- `panels = []` is an empty list, equivalent to `New-Object System.Collections.Generic.List` or `List<T>` in C#
+- `with open(...) as f` is Python's way of handling file streams — the `with` block automatically closes the file when done, like a `using` statement in C#
+- `next(reader)` just advances the iterator one row to skip the header
+- `row[0].strip()` — `.strip()` removes whitespace/newlines from a string, like `.Trim()` in C#
+- `replace(',', '')` strips commas from numbers before casting to int — same as `.Replace()` in C#
+- `panels.append((name, count))` — `.append()` adds to the list. `(name, count)` is a **tuple** — a lightweight immutable pair, like a mini struct. No class definition needed.
+
+---
+
+**Helper functions**
+```python
+def server_totals(servers):
+    return [sum(p[1] for p in s) for s in servers]
+```
+
+This is a **list comprehension** — Python's most distinctive syntax. The equivalent in PowerShell would be:
+```powershell
+$servers | ForEach-Object { ($_ | Measure-Object -Sum).Sum }
+```
+Reading it inside out: `p[1] for p in s` means "take index 1 (the count) from each panel tuple in server s", then `sum(...)` adds them up. The outer `[... for s in servers]` does that for every server and returns a list.
+
+```python
+def compute_std_dev(servers):
+    totals = server_totals(servers)
+    return stdev(totals) if len(totals) > 1 else 0.0
+```
+
+The `X if condition else Y` is Python's inline ternary — same as `condition ? X : Y` in C#. Guards against calling `stdev` on a single value which would crash.
+
+---
+
+**Greedy assignment**
+```python
+def greedy_assign(panels, num_servers):
+    servers = [[] for _ in range(num_servers)]
+    for panel in sorted(panels, key=lambda x: x[1], reverse=True):
+        totals = server_totals(servers)
+        servers[totals.index(min(totals))].append(panel)
+    return servers
+```
+
+- `[[] for _ in range(num_servers)]` — another list comprehension, creates a list of empty lists. The `_` is a throwaway variable name convention meaning "I don't actually need this value, just loop N times"
+- `sorted(panels, key=lambda x: x[1], reverse=True)` — sorts the panels list. `key=lambda x: x[1]` tells it what to sort by. A **lambda** is an anonymous inline function — `lambda x: x[1]` means "given x, return x[1]". Same as `panels.OrderByDescending(x => x.Item2)` in C# LINQ
+- `totals.index(min(totals))` — `min()` finds the smallest value, `.index()` finds its position in the list. Together that gives you the index of the lowest server
+
+---
+
+**Refinement — the core logic**
+```python
+def refine(servers, max_combo_depth=3):
+    improved = True
+    while improved:
+        improved = False
+        totals = server_totals(servers)
+        mu = mean(totals)
+```
+
+- `max_combo_depth=3` is a **default parameter** — if you don't pass it, it uses 3. Same as optional parameters in C#
+- The `while improved` loop keeps running as long as something changed. Setting `improved = False` at the top of each loop means "assume nothing will improve this pass, prove me wrong"
+- `mu` is just the mean — named after the Greek letter μ used in statistics
+
+**Strategy 1 — single move:**
+```python
+for i in range(len(servers)):
+    for j in range(len(servers)):
+        if i == j or totals[i] <= totals[j]:
+            continue
+        old_sq = (totals[i] - mu) ** 2 + (totals[j] - mu) ** 2
+        best_panel = None
+        best_sq = old_sq
+        for panel in servers[i]:
+            new_ti = totals[i] - panel[1]
+            new_tj = totals[j] + panel[1]
+            new_sq = (new_ti - mu) ** 2 + (new_tj - mu) ** 2
+            if new_sq < best_sq:
+                best_sq = new_sq
+                best_panel = panel
+        if best_panel:
+            servers[i].remove(best_panel)
+            servers[j].append(best_panel)
+            totals = server_totals(servers)
+            improved = True
+            break
+```
+
+- `**` is the exponent operator in Python — `x ** 2` is x squared, same as `Math.Pow(x, 2)` in C#
+- `continue` skips to the next loop iteration, same as in C#
+- The logic: for every pair where server i is heavier than server j, calculate the current "sum of squares" cost. Then try moving each panel from i to j and see if the new cost is lower. Track the best improvement found
+- `if best_panel:` — in Python, `None` is falsy, so this is equivalent to `if best_panel != null` in C#
+
+**Strategy 2 — swap:**
+```python
+for pi in servers[i]:
+    for pj in servers[j]:
+        new_ti = totals[i] - pi[1] + pj[1]
+        new_tj = totals[j] - pj[1] + pi[1]
+```
+Same idea but now you're trying every combination of one panel from each server and checking if swapping them reduces the sum of squares.
+
+**Strategy 3 — combination move:**
+```python
+for combo in itertools.combinations(servers[i], depth):
+    combo_sum = sum(p[1] for p in combo)
+```
+`itertools.combinations` generates every possible grouping of `depth` items from a list — so at depth 2 on a server with 10 panels, you'd get 45 pairs. `sum(p[1] for p in combo)` is a **generator expression** — like a list comprehension but without building the list, just feeds values into `sum()` directly, slightly more memory efficient.
+
+---
+
+**Output**
+```python
+print(f"  Server {idx}  |  Total: {total:>12,}  |  Delta: {delta:>+12,.0f}")
+```
+The `f"..."` is an **f-string** — Python's string interpolation, like `$"..."` in C# or `"$variable"` in PowerShell. Inside `{}` you can put any expression. The format spec after `:` controls display:
+- `>12` — right-align in 12 character width
+- `,` — add thousands separators
+- `+` — always show the sign (+ or -)
+- `.0f` — float with 0 decimal places
+
+---
+
+**Main entry point**
+```python
+if __name__ == "__main__":
+    main()
+```
+This is Python's way of saying "only run main() if this file was executed directly, not imported as a module." You'll see this in virtually every Python script — it's convention.
+
+```python
+filepath    = sys.argv[1]
+num_servers = int(sys.argv[2])
+group_name  = sys.argv[3]
+output_csv  = sys.argv[4] if len(sys.argv) >= 5 else None
+```
+`sys.argv` is the list of command line arguments — `argv[0]` is always the script name itself, so your actual arguments start at index 1. Same concept as `$args` in PowerShell or `args[]` in a C# Main method.
+
+---
+
+The main thing Python will feel different on coming from C#/PowerShell is that **indentation is syntax** — there are no curly braces, the indent level defines code blocks. Get that wrong and it either crashes or does the wrong thing silently. Everything else maps pretty cleanly to what you already know.
